@@ -1,0 +1,7 @@
+# One rule per line: "+ pattern" keeps, "- pattern" drops.
+# A rule on a directory covers everything below it; the deepest matching path wins,
+# and among rules matching the same path the later one wins.
+# "*" stays inside one path segment, "**" spans segments, "~/" is the home directory.
+
++ ~/Pictures/Screenshots
+- **/node_modules
