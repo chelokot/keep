@@ -51,54 +51,100 @@ struct HostReport<'index> {
     host: &'index str,
     roots: &'index [PathBuf],
     coverage: Coverage,
+    by_rule: Vec<Tally>,
     undecided_by_directory: HashMap<&'index Path, u64>,
     unreadable: usize,
 }
 
-pub fn render(indexes: &[Index], rules: &Rules, options: &Options) -> String {
+fn analyze<'index>(index: &'index Index, rules: &Rules, options: &Options) -> HostReport<'index> {
+    let mut classifier = Classifier::new(rules);
+    let mut coverage = Coverage::default();
     let mut by_rule = vec![Tally::default(); rules.list.len()];
-    let hosts: Vec<HostReport> = indexes
-        .iter()
-        .map(|index| {
-            let mut classifier = Classifier::new(rules);
-            let mut coverage = Coverage::default();
-            let mut undecided_by_directory: HashMap<&Path, u64> = HashMap::new();
-            let mut seen_inodes = HashSet::new();
-            for entry in &index.entries {
-                let size = if seen_inodes.insert(entry.inode) {
-                    entry.size
-                } else {
-                    0
-                };
-                match classifier.classify(&entry.path) {
-                    Some(rule) => {
-                        by_rule[rule].add(size);
-                        match rules.list[rule].verdict {
-                            Verdict::Keep => coverage.keep.add(size),
-                            Verdict::Drop => coverage.drop.add(size),
-                        }
-                    }
-                    None => {
-                        coverage.undecided.add(size);
-                        let root = index.roots.iter().find(|root| entry.path.starts_with(root));
-                        for ancestor in entry.path.ancestors().skip(1) {
-                            if root.is_none_or(|root| !ancestor.starts_with(root)) {
-                                break;
-                            }
-                            *undecided_by_directory.entry(ancestor).or_default() += size;
-                        }
-                    }
+    let mut undecided_by_directory: HashMap<&Path, u64> = HashMap::new();
+    let mut open_directories: Vec<(&Path, u64)> = Vec::new();
+    let mut seen_inodes = HashSet::with_capacity(index.entries.len());
+    for entry in &index.entries {
+        let size = if seen_inodes.insert(entry.inode) {
+            entry.size
+        } else {
+            0
+        };
+        match classifier.classify(&entry.path) {
+            Some(rule) => {
+                by_rule[rule].add(size);
+                match rules.list[rule].verdict {
+                    Verdict::Keep => coverage.keep.add(size),
+                    Verdict::Drop => coverage.drop.add(size),
                 }
             }
-            HostReport {
-                host: &index.host,
-                roots: &index.roots,
-                coverage,
-                undecided_by_directory,
-                unreadable: index.unreadable.len(),
+            None => {
+                coverage.undecided.add(size);
+                let directory = entry.path.parent().expect("indexed files have a parent");
+                if open_directories
+                    .last()
+                    .is_none_or(|&(open, _)| open.as_os_str() != directory.as_os_str())
+                {
+                    while let Some(&(open, bytes)) = open_directories.last()
+                        && !directory.starts_with(open)
+                    {
+                        open_directories.pop();
+                        if bytes >= options.min_bytes {
+                            undecided_by_directory.insert(open, bytes);
+                        }
+                    }
+                    let root = index
+                        .roots
+                        .iter()
+                        .find(|root| entry.path.starts_with(root))
+                        .expect("indexed files live under a root");
+                    let innermost_open = open_directories.last().map(|&(open, _)| open);
+                    let unopened: Vec<&Path> = directory
+                        .ancestors()
+                        .take_while(|ancestor| {
+                            ancestor.starts_with(root) && Some(*ancestor) != innermost_open
+                        })
+                        .collect();
+                    open_directories
+                        .extend(unopened.into_iter().rev().map(|ancestor| (ancestor, 0)));
+                }
+                for (_, bytes) in &mut open_directories {
+                    *bytes += size;
+                }
             }
-        })
-        .collect();
+        }
+    }
+    for (open, bytes) in open_directories {
+        if bytes >= options.min_bytes {
+            undecided_by_directory.insert(open, bytes);
+        }
+    }
+    HostReport {
+        host: &index.host,
+        roots: &index.roots,
+        coverage,
+        by_rule,
+        undecided_by_directory,
+        unreadable: index.unreadable.len(),
+    }
+}
+
+pub fn render(indexes: &[Index], rules: &Rules, options: &Options) -> String {
+    let hosts: Vec<HostReport> = std::thread::scope(|scope| {
+        let analyses: Vec<_> = indexes
+            .iter()
+            .map(|index| scope.spawn(|| analyze(index, rules, options)))
+            .collect();
+        analyses
+            .into_iter()
+            .map(|analysis| analysis.join().expect("host analysis panicked"))
+            .collect()
+    });
+    let mut by_rule = vec![Tally::default(); rules.list.len()];
+    for host in &hosts {
+        for (total, tally) in by_rule.iter_mut().zip(&host.by_rule) {
+            total.merge(*tally);
+        }
+    }
 
     let mut out = String::new();
     writeln!(out, "COVERAGE").unwrap();

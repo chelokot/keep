@@ -162,3 +162,27 @@ fn hardlinked_bytes_count_once() {
 
     assert!(report.contains("total 400.0 B"), "{report}");
 }
+
+#[test]
+fn report_uses_default_rules_and_every_index() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let home = &sandbox.path().join("home");
+    write(&home.join("Pictures/a.png"), 100);
+    write(&home.join("Downloads/b.iso"), 300);
+    write(&home.join("Music/c.flac"), 600);
+    fs::create_dir_all(home.join(".config/keep")).unwrap();
+    fs::write(home.join(".config/keep/rules"), "+ ~/Pictures\n").unwrap();
+
+    for (host, root) in [("laptop", "Pictures"), ("desktop", "Downloads")] {
+        keep(
+            home,
+            &["scan", "--host", host, home.join(root).to_str().unwrap()],
+        );
+    }
+    let report = keep(home, &["report"]);
+
+    assert!(report.contains("laptop"), "{report}");
+    assert!(report.contains("desktop"), "{report}");
+    assert!(report.contains("keep    100.0 B  25.0%"), "{report}");
+    assert!(report.contains("undecided    300.0 B  75.0%"), "{report}");
+}
